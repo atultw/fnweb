@@ -2,15 +2,17 @@ use std::error::Error;
 use std::fmt::{Debug, Display, Formatter, Pointer};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::process::exit;
 use std::sync::Arc;
 
-use futures::FutureExt;
+use futures::{FutureExt, TryFutureExt};
 use futures::never::Never;
 use hyper::{Body, Method, Response, Server};
-use routerify::{RouterBuilder, RouterService};
+use routerify::{Route, RouterBuilder, RouterService};
 use serde::Serialize;
 
 use crate::database::Database;
+use crate::handler::RouteOption::FinishWithError;
 
 pub struct AppInner {
     pub db: Database,
@@ -102,78 +104,151 @@ impl App {
     }
 }
 
-pub struct RouteFuture<I, E: Into<String>, FutureIn: Future<Output=(Request, RouteResult<I, E>)>> {
+// pub trait RouteFuture<I, FutureIn: Future<Output=(Request, I)>> {
+//     pub app: App,
+//     pub inp: FutureIn,
+// }
+
+pub enum RouteOption<T> {
+    Some(T),
+    FinishWithError((String, u16)),
+}
+
+pub struct ThrowingRouteFuture<I, FutureIn: Future<Output=RouteOption<(Request, I)>>> {
     pub app: App,
     pub inp: FutureIn,
 }
 
-pub struct RouteFutureFirst {
+
+pub struct InitialRouteFuture {
     pub app: App,
 }
 
-pub enum RouteResult<T, E: Into<String>> {
-    Ok(T),
-    Err((E, u16)),
-}
-
-pub fn receive<E: Into<String>>(req: Request, app: App) -> RouteFuture<(), E, impl Future<Output=(Request, RouteResult<(), E>)>> {
-    return RouteFuture {
+pub fn receive(req: Request, app: App) -> ThrowingRouteFuture<(), impl Future<Output=RouteOption<(Request, ())>>> {
+    return ThrowingRouteFuture {
         app: app,
-        inp: (|| async { (req, RouteResult::Ok(())) })(),
+        inp: async { RouteOption::Some((req, ())) },
     };
 }
 
-impl<I, E: Into<String>, F: Future<Output=(Request, RouteResult<I, E>)>> RouteFuture<I, E, F> {
-    pub fn run<O,
-        Ft: Future<Output=(Request, RouteResult<O, E>)>,
+impl<I, F: Future<Output=RouteOption<(Request, I)>>> ThrowingRouteFuture<I, F> {
+    // pub fn then<O, E,
+    //     Ft: Future<Output=(Request, Result<O, E>)>,
+    //     T: FnOnce(App, Request, I) -> Ft>
+    // (self, func: T) -> ThrowingRouteFuture<Result<O, E>, impl Future<Output=RouteOption<(Request, Result<O, E>)>>> {
+    //     let app = self.app.clone();
+    //     let inp2 = self.inp.then(move |pre| async {
+    //         match pre {
+    //             RouteOption::Some((req, pre)) => {
+    //                 RouteOption::Some(func(app, req, pre).await)
+    //             }
+    //             RouteOption::FinishWithError(e) => {
+    //                 RouteOption::FinishWithError(e)
+    //             }
+    //         }
+    //     });
+    //     return ThrowingRouteFuture {
+    //         app: self.app,
+    //         inp: inp2,
+    //     };
+    // }
+    pub fn then<O,
+        Ft: Future<Output=(Request, O)>,
         T: FnOnce(App, Request, I) -> Ft>
-    (self, func: T) -> RouteFuture<O, E, impl Future<Output=(Request, RouteResult<O, E>)>> {
+    (self, func: T) -> ThrowingRouteFuture<O, impl Future<Output=RouteOption<(Request, O)>>> {
         let app = self.app.clone();
-        let inp2 = self.inp.then(move |inpp| {
-            let app = self.app.clone();
-            async move {
-                match inpp.1 {
-                    RouteResult::Ok(inn) => {
-                        (func(app, inpp.0, inn).await)
-                    }
-                    RouteResult::Err(err) => {
-                        (inpp.0, RouteResult::Err(err))
-                    }
+        let inp2 = self.inp.then(move |pre| async {
+            match pre {
+                RouteOption::Some((req, pre)) => {
+                    RouteOption::Some(func(app, req, pre).await)
+                }
+                RouteOption::FinishWithError(e) => {
+                    RouteOption::FinishWithError(e)
                 }
             }
         });
-        return RouteFuture {
+        return ThrowingRouteFuture {
+            app: self.app,
+            inp: inp2,
+        };
+    }
+}
+
+impl<I, E, F: Future<Output=RouteOption<(Request, Result<I, E>)>>> ThrowingRouteFuture<Result<I, E>, F> {
+    /// Closure passed to this function will be called when a previous step fails with `Result::Err`.
+    /// The stream will stop after this step and respond with the returned `String`, and status code.
+    pub fn catch<
+        Ft: Future<Output=(String, u16)>,
+        T: FnOnce(E) -> Ft>
+    (self, func: T) -> ThrowingRouteFuture<I, impl Future<Output=RouteOption<(Request, I)>>> {
+        let app = self.app.clone();
+        let inp2 = self.inp.then(move |inp| async {
+            match inp {
+                RouteOption::Some((req, pre)) => {
+                    match pre {
+                        Ok(ok) => {
+                            return RouteOption::Some((req, ok));
+                        }
+                        Err(err) => {
+                            return FinishWithError(func(err).await);
+                        }
+                    }
+                }
+                RouteOption::FinishWithError((err, code)) => { return FinishWithError((err, code)); }
+            }
+        });
+        return ThrowingRouteFuture {
             app: app,
             inp: inp2,
         };
     }
 }
 
-impl<I, E: Into<String>, F: Future<Output=(Request, RouteResult<I, E>)>> RouteFuture<I, E, F> where I: Into<Body> {
+impl<I, F: Future<Output=RouteOption<(Request, I)>>> ThrowingRouteFuture<I, F> where I: Into<Body> {
     pub async fn finish(self) -> Result<Response<Body>, Never> {
-        match self.inp.await.1 {
-            RouteResult::Ok(ok) => { Ok(Response::builder().status(200).body(ok.into()).unwrap()) }
-            // TODO: real status
-            RouteResult::Err(err) => { Ok(Response::builder().status(err.1).body(Body::from(err.0.into())).unwrap()) }
+        match self.inp.await {
+            RouteOption::Some((_, res)) => {
+                Ok(Response::builder().status(200).body(res.into()).unwrap())
+            }
+            RouteOption::FinishWithError((err, code)) => {
+                Ok(Response::builder().status(code).body(err.into()).unwrap())
+            }
         }
     }
 }
 
 pub trait Responder {
-    fn respond(self) -> RouteResult<String, &'static str>;
+    fn respond(self) -> Result<String, &'static str>;
 }
 
-impl<A: Serialize, B: Error> Responder for Result<Option<A>, B> {
-    fn respond(self) -> RouteResult<String, &'static str> {
+// impl<A: Serialize, B: Error> Responder for Result<Option<A>, B> {
+//     fn respond(self) -> Result<String, &'static str> {
+//         match self {
+//             Ok(Some(user)) => {
+//                 return Result::Ok(serde_json::to_string(&user).unwrap());
+//             }
+//             Ok(None) => {
+//                 return Result::Err(("Not Found", 404));
+//             }
+//             Err(e) => {
+//                 return Result::Err(("Database error", 500));
+//             }
+//         }
+//     }
+// }
+
+pub trait Combine<First, Error> {
+    fn adding<Second>(self, second: Second) -> Result<(First, Second), Error>;
+}
+
+impl<First, Error> Combine<First, Error> for Result<First, Error> {
+    fn adding<Second>(self, second: Second) -> Result<(First, Second), Error> {
         match self {
-            Ok(Some(user)) => {
-                return RouteResult::Ok(serde_json::to_string(&user).unwrap());
+            Ok(first) => {
+                Ok((first, second))
             }
-            Ok(None) => {
-                return RouteResult::Err(("Not Found", 404));
-            }
-            Err(e) => {
-                return RouteResult::Err(("Database error", 500));
+            Err(err) => {
+                Err(err)
             }
         }
     }
