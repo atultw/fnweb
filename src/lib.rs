@@ -1,18 +1,22 @@
-mod handler;
+mod pipeline;
 mod database;
+mod frontend;
+mod application;
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::{Debug, Error};
-    use crate::handler::Combine;
+    use std::fmt::{Error};
 
-    use hyper::{Body, Response};
+    use hyper::{Response};
     use mongodb::bson::doc;
     use routerify::prelude::RequestExt;
     use serde::{Deserialize, Serialize};
 
+    use crate::application::App;
     use crate::database::Database;
-    use crate::handler::{App, Frontend, receive, Request, Responder};
+    use crate::frontend::Frontend;
+    use crate::pipeline::{Pipeline, Request};
+    use crate::pipeline::Combine;
 
     #[derive(Serialize, Deserialize)]
     struct User {
@@ -26,52 +30,52 @@ mod tests {
         Ok(user)
     }
 
-    fn ip_filter(_: App, req: &Request) -> Result<String, String> {
-        let ip = String::from(req.headers().get("X-Forwarded-For").unwrap().to_str().unwrap());
-        Ok(ip)
+    fn date_time() -> String {
+        let dt: String = chrono::Local::now().format("%Y-%m-%d][%H:%M:%S").to_string();
+        dt
     }
 
     #[tokio::test]
     async fn it_works() {
-        // let get_user = move |app, req| async move {
-        //     receive(req, app)
-        //         .then(|a, req, _| async move {
-        //             let id_str: Option<&String> = req.param("id");
-        //             match id_str {
-        //                 Some(oid) => {
-        //                     let res = a
-        //                         .database()
-        //                         .retrieve_one::<User>(String::from("users"), doc! {"id":oid})
-        //                         .await;
-        //                     (req, res.map_err(|s| "database"))
-        //                 }
-        //                 None => {
-        //                     return (req, Err("no id param"));
-        //                 }
-        //             }
-        //         })
-        //         .finish().await
-        // };
+        let get_user = move |app, req| async move {
+            Pipeline::receive(req, app)
+                .then(|_, req| async move {
+                    req.param("id").map(|x| x.clone())
+                })
+                .if_none(("No id provided".into(), 400))
+                .then(|app, oid| async move {
+                    app
+                        .database()
+                        .retrieve_one::<User>(String::from("users"), doc! {"id":oid})
+                        .await
+                })
+                .catch(|err| {
+                    (format!("Database error: {}", err.to_string()), 500)
+                })
+                .if_none(("User not found".into(), 404))
+                .then(|_, object| async move {
+                    serde_json::to_string(&object)
+                })
+                .catch(|_| {
+                    ("Serialization error", 500)
+                })
+                .finish().await
+        };
+
         let hello = move |app, req| async move {
-            receive(req, app)
-                .then(|a, req, _| async move {
-                    (req, auth_filter(a, &req).await)
+            Pipeline::receive(req, app)
+                .then(|a, req| async move {
+                    auth_filter(a, &req).await.adding(req)
                 })
-                .catch(|err| async move {
-                    ("Auth error".to_string(), 401)
+                .catch(|err| {
+                    (format!("Database error: {}", err.to_string()), 401)
                 })
-                .then(|a, req, u| async move {
-                    (req, ip_filter(a, &req).adding(u))
+                .then(|_, (u, req)| async move {
+                    (date_time(), u)
                 })
-                .catch(|err| async move {
-                    ("Couldn't get your ip".to_string(), 400)
+                .then(|_, (time, u)| async move {
+                    "Hello, ".to_owned() + u.name.as_str() + "! It is currently: " + &*time
                 })
-                .then(|a, req, (ip, u)| async move {
-                    (req, "Hello, ".to_owned() + u.name.as_str() + "! Your IP is:" + &*ip)
-                })
-                // .catch(|err| async move {
-                //     ("unknown".to_string(), 500)
-                // })
                 .finish().await
         };
         let db = Database::new("mongodb://localhost:27017").await;
@@ -80,6 +84,7 @@ mod tests {
         frontend
             // .get("/user/:id", get_user)
             .get("/hello", hello)
+            .get("/users/:id", get_user)
             .launch().await.unwrap()
     }
 }
